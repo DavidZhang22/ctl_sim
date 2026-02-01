@@ -1,9 +1,9 @@
 # Simulator for the 2025 CTL format
 
-# Installation
+## Installation
 
 pip install -r requirements.txt
 
-# Usage
+## Usage
 
 streamlit run ./test.py
