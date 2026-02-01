@@ -7,6 +7,9 @@
 #   THAT match's recorded score to 6-7 (buyer gets 6), which flips who is the recorded winner
 #   and thus flips who picks first next round.
 #
+# Additional rule:
+# - The Round 2 ban cannot be the same player that team banned in Round 1.
+#
 # Run:
 #   pip install streamlit pandas
 #   streamlit run app.py
@@ -16,7 +19,7 @@ from __future__ import annotations
 import math
 import itertools
 from functools import lru_cache
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict
 
 import streamlit as st
 import pandas as pd
@@ -32,9 +35,8 @@ def normal_cdf(x: float) -> float:
 
 def glicko_to_win_prob(ra: float, rb: float, sigma: float) -> float:
     """
-    Your assumption:
-      200 rating difference ~ 1 std dev in win chance.
-    Interpreted as a probit model:
+    sigma rating difference ~ 1 std dev in win chance.
+    Probit model:
       P(A wins) = Φ((ra-rb)/sigma)
     """
     p = normal_cdf((ra - rb) / sigma)
@@ -255,18 +257,13 @@ class TeamMatchSolver:
     """
     Solves optimal play from Team A perspective.
 
-    objective:
-      - "diff": maximize expected (A_total_points - B_total_points)
-      - "points": maximize expected A_total_points (opponent minimizes A_total_points)
-
-    rating_model:
-      - "match": Φ((ra-rb)/sigma) is match win prob for FT7, invert to per-point prob q
-      - "point": Φ((ra-rb)/sigma) is per-point prob q directly
-
-    buy rule (fixed, per your clarification):
+    buy rule:
       After a match is played, the actual winner may buy counterpick by rewriting THAT match's
       recorded score to 6-7, with the buyer getting 6 (so recorded winner flips).
       The buy decision can depend on the realized final score (7-k vs 7-6 etc.).
+
+    additional ban rule:
+      Round 2 ban cannot be the same player that team banned in Round 1.
     """
 
     def __init__(
@@ -290,7 +287,7 @@ class TeamMatchSolver:
         self.objective = objective
         self.rating_model = rating_model
 
-        # Precompute per-point q and the FT7 distributions for each pairing
+        # Precompute per-point q and FT7 distributions for each pairing
         self.q = [[0.0] * 5 for _ in range(5)]
         self.dist = [[None] * 5 for _ in range(5)]  # type: ignore
         for i in range(5):
@@ -309,18 +306,26 @@ class TeamMatchSolver:
         return float(a_pts)
 
     @lru_cache(None)
-    def solve_state(self, round_idx: int, maskA: int, maskB: int, prev_winner: int) -> float:
-        """
-        Value from START of round_idx given remaining players and prev_winner (0=A, 1=B),
-        where prev_winner picks first in rounds 2-5.
-        Round 1 is handled separately via solve_round1().
-        """
+    def solve_state(
+        self,
+        round_idx: int,
+        maskA: int,
+        maskB: int,
+        prev_winner: int,
+        ban1_A_on_B: int,
+        ban1_B_on_A: int,
+    ) -> float:
         if round_idx == 6:
             return 0.0
         if round_idx == 2:
-            return self.solve_round2(maskA, maskB, prev_winner)
+            return self.solve_round2(maskA, maskB, prev_winner, ban1_A_on_B, ban1_B_on_A)
         if round_idx in (3, 4, 5):
-            return self.solve_seq(round_idx, maskA, maskB, maskA, maskB, first_picker=prev_winner)
+            return self.solve_seq(
+                round_idx, maskA, maskB, maskA, maskB,
+                first_picker=prev_winner,
+                ban1_A_on_B=ban1_A_on_B,
+                ban1_B_on_A=ban1_B_on_A
+            )
         raise ValueError("Round 1 must be solved via solve_round1().")
 
     def buy_decision_for_outcome(
@@ -330,10 +335,11 @@ class TeamMatchSolver:
         newMaskB: int,
         actual_a: int,
         actual_b: int,
+        ban1_A_on_B: int,
+        ban1_B_on_A: int,
     ) -> Tuple[bool, float]:
         """
-        Given an ACTUAL terminal score (actual_a, actual_b), decide whether the actual winner
-        buys counterpick. Returns (buy?, chosen_total_value_for_A_from_this_outcome).
+        Returns (buy?, chosen_total_value_for_A_from_this_outcome).
 
         If buy happens, recorded score becomes:
           - If A was actual winner: (6,7), next prev_winner=B
@@ -344,11 +350,15 @@ class TeamMatchSolver:
         if actual_a == 7:
             # A is actual winner: A chooses max
             keep_immediate = self.immediate_value(actual_a, actual_b)
-            keep_cont = 0.0 if is_last else self.solve_state(round_idx + 1, newMaskA, newMaskB, prev_winner=0)
+            keep_cont = 0.0 if is_last else self.solve_state(
+                round_idx + 1, newMaskA, newMaskB, 0, ban1_A_on_B, ban1_B_on_A
+            )
             keep_total = keep_immediate + keep_cont
 
             buy_immediate = self.immediate_value(6, 7)
-            buy_cont = 0.0 if is_last else self.solve_state(round_idx + 1, newMaskA, newMaskB, prev_winner=1)
+            buy_cont = 0.0 if is_last else self.solve_state(
+                round_idx + 1, newMaskA, newMaskB, 1, ban1_A_on_B, ban1_B_on_A
+            )
             buy_total = buy_immediate + buy_cont
 
             if buy_total > keep_total + 1e-12:
@@ -357,11 +367,15 @@ class TeamMatchSolver:
 
         # B is actual winner: B chooses min (to minimize A value)
         keep_immediate = self.immediate_value(actual_a, actual_b)
-        keep_cont = 0.0 if is_last else self.solve_state(round_idx + 1, newMaskA, newMaskB, prev_winner=1)
+        keep_cont = 0.0 if is_last else self.solve_state(
+            round_idx + 1, newMaskA, newMaskB, 1, ban1_A_on_B, ban1_B_on_A
+        )
         keep_total = keep_immediate + keep_cont
 
         buy_immediate = self.immediate_value(7, 6)
-        buy_cont = 0.0 if is_last else self.solve_state(round_idx + 1, newMaskA, newMaskB, prev_winner=0)
+        buy_cont = 0.0 if is_last else self.solve_state(
+            round_idx + 1, newMaskA, newMaskB, 0, ban1_A_on_B, ban1_B_on_A
+        )
         buy_total = buy_immediate + buy_cont
 
         if buy_total < keep_total - 1e-12:
@@ -369,29 +383,38 @@ class TeamMatchSolver:
         return False, keep_total
 
     @lru_cache(None)
-    def pair_value(self, round_idx: int, maskA: int, maskB: int, a: int, b: int) -> float:
-        """
-        Expected value for Team A if this round plays A=a vs B=b, INCLUDING optimal buy decision
-        after the match (and continuation).
-        """
+    def pair_value(
+        self,
+        round_idx: int,
+        maskA: int,
+        maskB: int,
+        a: int,
+        b: int,
+        ban1_A_on_B: int,
+        ban1_B_on_A: int,
+    ) -> float:
         newA = maskA & ~(1 << a)
         newB = maskB & ~(1 << b)
 
         total = 0.0
         dist = self.dist[a][b]
         for aa, bb, p in dist:
-            _, chosen = self.buy_decision_for_outcome(round_idx, newA, newB, aa, bb)
+            _, chosen = self.buy_decision_for_outcome(
+                round_idx, newA, newB, aa, bb, ban1_A_on_B, ban1_B_on_A
+            )
             total += p * chosen
         return total
 
-    def pair_display_stats(self, round_idx: int, maskA: int, maskB: int, a: int, b: int) -> Dict:
-        """
-        For UI: return detailed stats including:
-          - Original dist and expectations (before any buy rewrite)
-          - Buy decisions per terminal outcome
-          - Recorded expectations (after applying buy decisions)
-          - Probability recorded-winner is A (important for who picks first next round)
-        """
+    def pair_display_stats(
+        self,
+        round_idx: int,
+        maskA: int,
+        maskB: int,
+        a: int,
+        b: int,
+        ban1_A_on_B: int,
+        ban1_B_on_A: int,
+    ) -> Dict:
         newA = maskA & ~(1 << a)
         newB = maskB & ~(1 << b)
 
@@ -399,7 +422,6 @@ class TeamMatchSolver:
         pAwin, Ea_orig, Eb_orig = score_expectations_from_dist(dist)
         mode_a, mode_b, mode_p = outcome_mode(dist)
 
-        # Apply buy decisions to compute recorded expectations
         Ea_rec = 0.0
         Eb_rec = 0.0
         p_buy = 0.0
@@ -407,7 +429,9 @@ class TeamMatchSolver:
 
         rows = []
         for aa, bb, p in dist:
-            buy, _ = self.buy_decision_for_outcome(round_idx, newA, newB, aa, bb)
+            buy, _ = self.buy_decision_for_outcome(
+                round_idx, newA, newB, aa, bb, ban1_A_on_B, ban1_B_on_A
+            )
 
             if buy:
                 p_buy += p
@@ -452,46 +476,58 @@ class TeamMatchSolver:
         eligA: int,
         eligB: int,
         first_picker: int,
+        ban1_A_on_B: int,
+        ban1_B_on_A: int,
     ) -> float:
-        """
-        Sequential pick:
-          first_picker chooses their player, other counters.
-        """
         if first_picker == 0:
-            # A picks first to maximize; B counters to minimize
             best = -1e100
             for a in _bits(eligA):
                 worst = 1e100
                 for b in _bits(eligB):
-                    val = self.pair_value(round_idx, maskA, maskB, a, b)
+                    val = self.pair_value(round_idx, maskA, maskB, a, b, ban1_A_on_B, ban1_B_on_A)
                     worst = min(worst, val)
                 best = max(best, worst)
             return best
         else:
-            # B picks first to minimize; A counters to maximize
             best_for_B = 1e100
             for b in _bits(eligB):
                 best_resp_A = -1e100
                 for a in _bits(eligA):
-                    val = self.pair_value(round_idx, maskA, maskB, a, b)
+                    val = self.pair_value(round_idx, maskA, maskB, a, b, ban1_A_on_B, ban1_B_on_A)
                     best_resp_A = max(best_resp_A, val)
                 best_for_B = min(best_for_B, best_resp_A)
             return best_for_B
 
-    def solve_round2(self, maskA: int, maskB: int, prev_winner: int) -> float:
+    def solve_round2(
+        self,
+        maskA: int,
+        maskB: int,
+        prev_winner: int,
+        ban1_A_on_B: int,
+        ban1_B_on_A: int
+    ) -> float:
         """
-        Round 2: simultaneous ban (each bans 1 opponent from THIS round),
-        then sequential pick with prev_winner picking first.
+        Round 2: simultaneous ban (cannot repeat Round 1 ban), then sequential pick.
         """
-        A_bans = list(_bits(maskB))  # A bans a B player (for round2 only)
-        B_bans = list(_bits(maskA))  # B bans an A player
+        A_bans = [b for b in _bits(maskB) if b != ban1_A_on_B]
+        B_bans = [a for a in _bits(maskA) if a != ban1_B_on_A]
+
+        if not A_bans:
+            A_bans = list(_bits(maskB))
+        if not B_bans:
+            B_bans = list(_bits(maskA))
 
         payoff = [[0.0 for _ in B_bans] for __ in A_bans]
         for i, banB in enumerate(A_bans):
             for j, banA in enumerate(B_bans):
                 eligA = maskA & ~(1 << banA)
                 eligB = maskB & ~(1 << banB)
-                payoff[i][j] = self.solve_seq(2, maskA, maskB, eligA, eligB, first_picker=prev_winner)
+                payoff[i][j] = self.solve_seq(
+                    2, maskA, maskB, eligA, eligB,
+                    first_picker=prev_winner,
+                    ban1_A_on_B=ban1_A_on_B,
+                    ban1_B_on_A=ban1_B_on_A
+                )
 
         v, _, _ = solve_zero_sum_game(payoff)
         return v
@@ -521,7 +557,8 @@ class TeamMatchSolver:
                 P = [[0.0 for _ in B_picks] for __ in A_picks]
                 for ia, a in enumerate(A_picks):
                     for ib, b in enumerate(B_picks):
-                        P[ia][ib] = self.pair_value(1, fullA, fullB, a, b)
+                        # Pass Round-1 bans forward so Round-2 cannot repeat them.
+                        P[ia][ib] = self.pair_value(1, fullA, fullB, a, b, banB, banA)
 
                 v_pick, p_pick, q_pick = solve_zero_sum_game(P)
                 ban_payoff[i][j] = v_pick
@@ -539,10 +576,17 @@ def argmax_prob(actions: List[int], probs: List[float]) -> int:
     return actions[max(range(len(actions)), key=lambda i: probs[i])]
 
 
-def best_seq_picks(solver: TeamMatchSolver, round_idx: int, maskA: int, maskB: int, eligA: int, eligB: int, first_picker: int):
-    """
-    Return (a_pick, b_pick) according to minimax for sequential pick stage.
-    """
+def best_seq_picks(
+    solver: TeamMatchSolver,
+    round_idx: int,
+    maskA: int,
+    maskB: int,
+    eligA: int,
+    eligB: int,
+    first_picker: int,
+    ban1_A_on_B: int,
+    ban1_B_on_A: int,
+):
     if first_picker == 0:
         best_val = -1e100
         best_a = None
@@ -551,7 +595,7 @@ def best_seq_picks(solver: TeamMatchSolver, round_idx: int, maskA: int, maskB: i
             worst_val = 1e100
             worst_b = None
             for b in _bits(eligB):
-                val = solver.pair_value(round_idx, maskA, maskB, a, b)
+                val = solver.pair_value(round_idx, maskA, maskB, a, b, ban1_A_on_B, ban1_B_on_A)
                 if val < worst_val:
                     worst_val = val
                     worst_b = b
@@ -559,46 +603,63 @@ def best_seq_picks(solver: TeamMatchSolver, round_idx: int, maskA: int, maskB: i
                 best_val = worst_val
                 best_a, best_b = a, worst_b
         return best_a, best_b
-    else:
-        best_for_B = 1e100
-        best_b = None
-        best_a = None
-        for b in _bits(eligB):
-            best_resp_A = -1e100
-            best_a_for_b = None
-            for a in _bits(eligA):
-                val = solver.pair_value(round_idx, maskA, maskB, a, b)
-                if val > best_resp_A:
-                    best_resp_A = val
-                    best_a_for_b = a
-            if best_resp_A < best_for_B:
-                best_for_B = best_resp_A
-                best_b, best_a = b, best_a_for_b
-        return best_a, best_b
+
+    best_for_B = 1e100
+    best_b = None
+    best_a = None
+    for b in _bits(eligB):
+        best_resp_A = -1e100
+        best_a_for_b = None
+        for a in _bits(eligA):
+            val = solver.pair_value(round_idx, maskA, maskB, a, b, ban1_A_on_B, ban1_B_on_A)
+            if val > best_resp_A:
+                best_resp_A = val
+                best_a_for_b = a
+        if best_resp_A < best_for_B:
+            best_for_B = best_resp_A
+            best_b, best_a = b, best_a_for_b
+    return best_a, best_b
 
 
-def round2_bans_and_picks_deterministic(solver: TeamMatchSolver, maskA: int, maskB: int, prev_winner: int):
-    """
-    Compute equilibrium for Round 2 ban stage; pick the highest-prob bans for a concrete playthrough;
-    then compute minimax sequential picks given those bans and pick order.
-    """
-    A_bans = list(_bits(maskB))
-    B_bans = list(_bits(maskA))
+def round2_bans_and_picks_deterministic(
+    solver: TeamMatchSolver,
+    maskA: int,
+    maskB: int,
+    prev_winner: int,
+    ban1_A_on_B: int,
+    ban1_B_on_A: int,
+):
+    # Respect "cannot repeat round-1 ban"
+    A_bans = [b for b in _bits(maskB) if b != ban1_A_on_B]
+    B_bans = [a for a in _bits(maskA) if a != ban1_B_on_A]
+    if not A_bans:
+        A_bans = list(_bits(maskB))
+    if not B_bans:
+        B_bans = list(_bits(maskA))
 
     payoff = [[0.0 for _ in B_bans] for __ in A_bans]
     for i, banB in enumerate(A_bans):
         for j, banA in enumerate(B_bans):
             eligA = maskA & ~(1 << banA)
             eligB = maskB & ~(1 << banB)
-            payoff[i][j] = solver.solve_seq(2, maskA, maskB, eligA, eligB, first_picker=prev_winner)
+            payoff[i][j] = solver.solve_seq(
+                2, maskA, maskB, eligA, eligB,
+                first_picker=prev_winner,
+                ban1_A_on_B=ban1_A_on_B,
+                ban1_B_on_A=ban1_B_on_A
+            )
 
     v, pA, pB = solve_zero_sum_game(payoff)
     banB = argmax_prob(A_bans, pA)
     banA = argmax_prob(B_bans, pB)
+
     eligA = maskA & ~(1 << banA)
     eligB = maskB & ~(1 << banB)
 
-    a_pick, b_pick = best_seq_picks(solver, 2, maskA, maskB, eligA, eligB, first_picker=prev_winner)
+    a_pick, b_pick = best_seq_picks(
+        solver, 2, maskA, maskB, eligA, eligB, first_picker=prev_winner,
+        ban1_A_on_B=ban1_A_on_B, ban1_B_on_A=ban1_B_on_A
+    )
 
     return {
         "ban_value": v,
@@ -649,6 +710,7 @@ with col2:
     st.markdown("**Team B**")
     dfB = st.data_editor(defaultB, num_rows="fixed", key="teamB")
 
+
 def validate_df(df: pd.DataFrame) -> Tuple[List[str], List[float]]:
     if "Name" not in df.columns or "Glicko" not in df.columns:
         raise ValueError("Table must have columns Name and Glicko.")
@@ -657,6 +719,7 @@ def validate_df(df: pd.DataFrame) -> Tuple[List[str], List[float]]:
     if len(names) != 5 or len(gl) != 5:
         raise ValueError("Need exactly 5 rows per team.")
     return names, gl
+
 
 run = st.button("Compute optimal strategies")
 
@@ -696,13 +759,15 @@ if run:
     st.markdown(f"**Game value from start (Team A objective = `{objective}`):** {v_start:.4f}")
 
     # Deterministic ban resolution (highest-prob) for a concrete playthrough
-    banB_r1 = argmax_prob(A_ban_actions, p_banA)
-    banA_r1 = argmax_prob(B_ban_actions, p_banB)
+    banB_r1 = argmax_prob(A_ban_actions, p_banA)  # A banned this B player in round 1
+    banA_r1 = argmax_prob(B_ban_actions, p_banB)  # B banned this A player in round 1
     v_pick, p_pickA, p_pickB, A_picks, B_picks = pick_strats[(banB_r1, banA_r1)]
 
     c3, c4 = st.columns(2)
     with c3:
-        st.markdown(f"**Round 1 blind-pick mix for Team A** (given bans: A banned `{namesB[banB_r1]}`, B banned `{namesA[banA_r1]}`)")
+        st.markdown(
+            f"**Round 1 blind-pick mix for Team A** (given bans: A banned `{namesB[banB_r1]}`, B banned `{namesA[banA_r1]}`)"
+        )
         st.dataframe(dist_table(A_picks, p_pickA, namesA), use_container_width=True, hide_index=True)
     with c4:
         st.markdown("**Round 1 blind-pick mix for Team B**")
@@ -711,7 +776,7 @@ if run:
     pickA_r1 = argmax_prob(A_picks, p_pickA)
     pickB_r1 = argmax_prob(B_picks, p_pickB)
 
-    # ---------- Concrete "optimal" playthrough (deterministic selections at mixed stages) ----------
+    # ---------- Concrete playthrough ----------
     st.subheader("Concrete optimal playthrough (deterministic choices at mixed stages)")
 
     fullA = (1 << 5) - 1
@@ -723,7 +788,7 @@ if run:
     round_details = []
 
     # Round 1
-    stats1 = solver.pair_display_stats(1, maskA, maskB, pickA_r1, pickB_r1)
+    stats1 = solver.pair_display_stats(1, maskA, maskB, pickA_r1, pickB_r1, banB_r1, banA_r1)
     play_rows.append({
         "Round": 1,
         "Format": "ban + blind pick",
@@ -742,16 +807,17 @@ if run:
     })
     round_details.append(("Round 1 details (buy decisions per possible final score)", stats1["details_df"]))
 
-    # Update remaining players
     maskA &= ~(1 << pickA_r1)
     maskB &= ~(1 << pickB_r1)
 
-    # Determine who is "previous winner" for next round pick order in this concrete playthrough:
     prev_winner = 0 if stats1["p_recorded_A_winner"] >= 0.5 else 1
 
-    # Round 2
-    r2 = round2_bans_and_picks_deterministic(solver, maskA, maskB, prev_winner=prev_winner)
-    stats2 = solver.pair_display_stats(2, maskA, maskB, r2["a"], r2["b"])
+    # Round 2 (respecting "cannot repeat round-1 ban")
+    r2 = round2_bans_and_picks_deterministic(
+        solver, maskA, maskB, prev_winner=prev_winner,
+        ban1_A_on_B=banB_r1, ban1_B_on_A=banA_r1
+    )
+    stats2 = solver.pair_display_stats(2, maskA, maskB, r2["a"], r2["b"], banB_r1, banA_r1)
     play_rows.append({
         "Round": 2,
         "Format": "ban + sequential pick",
@@ -776,8 +842,11 @@ if run:
 
     # Rounds 3-5
     for rnd in [3, 4, 5]:
-        a_pick, b_pick = best_seq_picks(solver, rnd, maskA, maskB, maskA, maskB, first_picker=prev_winner)
-        stats = solver.pair_display_stats(rnd, maskA, maskB, a_pick, b_pick)
+        a_pick, b_pick = best_seq_picks(
+            solver, rnd, maskA, maskB, maskA, maskB, first_picker=prev_winner,
+            ban1_A_on_B=banB_r1, ban1_B_on_A=banA_r1
+        )
+        stats = solver.pair_display_stats(rnd, maskA, maskB, a_pick, b_pick, banB_r1, banA_r1)
 
         play_rows.append({
             "Round": rnd,
@@ -802,7 +871,6 @@ if run:
         prev_winner = 0 if stats["p_recorded_A_winner"] >= 0.5 else 1
 
     df_play = pd.DataFrame(play_rows)
-
     st.dataframe(df_play, use_container_width=True, hide_index=True)
 
     total_orig_A = float(df_play["Original E[A pts]"].sum())
@@ -825,8 +893,8 @@ if run:
 
     st.subheader("Per-round score outcomes and buy decisions")
     st.caption(
-        "Rows where **Buy counterpick? = YES** show the key thing you asked for: "
-        "the **original score** for that outcome AND the **recorded score** after it gets rewritten to 6–7 (buyer gets 6)."
+        "Rows where **Buy counterpick? = YES** show the **original score** for that outcome "
+        "and the **recorded score** after it gets rewritten to 6–7 (buyer gets 6)."
     )
     for title, ddf in round_details:
         with st.expander(title, expanded=False):
